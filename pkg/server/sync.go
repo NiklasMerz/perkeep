@@ -370,6 +370,13 @@ func (sh *SyncHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 				http.Redirect(rw, req, "./", http.StatusFound)
 				return
 			}
+		} else if req.FormValue("mode") == "cancel" {
+			token := req.FormValue("token")
+			if xsrftoken.Valid(token, auth.Token(), "user", "runCancel") {
+				sh.cancelFullValidation()
+				http.Redirect(rw, req, "./", http.StatusFound)
+				return
+			}
 		}
 		http.Error(rw, "Bad POST request", http.StatusBadRequest)
 		return
@@ -427,6 +434,9 @@ func (sh *SyncHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	if len(sh.vshards) == 0 || sh.vshardDone == len(sh.vshards) {
 		token := xsrftoken.Generate(auth.Token(), "user", "runFullValidate")
 		f("<form method='POST'><input type='hidden' name='mode' value='validate'><input type='hidden' name='token' value='%s'><input type='submit' value='Start validation'></form>", token)
+	} else {
+		token := xsrftoken.Generate(auth.Token(), "user", "runCancel")
+		f("<form method='POST'><input type='hidden' name='mode' value='cancel'><input type='hidden' name='token' value='%s'><input type='submit' value='Cancel validation'></form>", token)
 	}
 	if len(sh.vshards) != 0 {
 		f("<ul>")
@@ -743,9 +753,17 @@ func (sh *SyncHandler) startFullValidation() {
 		return
 	}
 	sh.vshards = shards
-	sh.mu.Unlock()
+	sh.mu.Lock()
 
 	go sh.runFullValidation()
+}
+
+func (sh *SyncHandler) cancelFullValidation() {
+	sh.logf("canceling full validation")
+	sh.mu.Lock()
+	_, cancel := context.WithCancel(context.TODO())
+	cancel()
+	sh.mu.Lock()
 }
 
 func (sh *SyncHandler) runFullValidation() {

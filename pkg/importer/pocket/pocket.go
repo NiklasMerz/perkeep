@@ -18,7 +18,7 @@ limitations under the License.
 package pocket // import "perkeep.org/pkg/importer/pocket"
 
 import (
-	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"html"
@@ -28,27 +28,24 @@ import (
 	"os"
 	"path"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
+	"golang.org/x/oauth2"
 	"perkeep.org/internal/httputil"
 	"perkeep.org/pkg/importer"
 	"perkeep.org/pkg/schema"
 	"perkeep.org/pkg/schema/nodeattr"
-
-	"github.com/garyburd/go-oauth/oauth"
 
 	"go4.org/ctxutil"
 	"go4.org/syncutil"
 )
 
 const (
-	apiURL                        = "https://getpocket.com/v3"
-	temporaryCredentialRequestURL = "https://getpocket.com/v3/oauth/request"
-	resourceOwnerAuthorizationURL = "https://getpocket.com/auth/authorize"
-	tokenRequestURL               = "https://getpocket.com/v3/oauth/authorize"
-	userRetrievePath              = "get"
+	apiURL           = "https://getpocket.com/v3"
+	tokenURL         = "https://getpocket.com/v3/oauth/request"
+	authURL          = "https://getpocket.com/v3/oauth/authorize"
+	userRetrievePath = "get"
 
 	// runCompleteVersion is a cache-busting version number of the
 	// importer code. It should be incremented whenever the
@@ -64,12 +61,6 @@ const (
 	// A tweet is stored as a permanode with the "twitter.com:tweet" camliNodeType value.
 	nodeTypeArticle = "getpocket.com:article"
 )
-
-var oAuthURIs = importer.OAuthURIs{
-	TemporaryCredentialRequestURI: temporaryCredentialRequestURL,
-	ResourceOwnerAuthorizationURI: resourceOwnerAuthorizationURL,
-	TokenRequestURI:               tokenRequestURL,
-}
 
 func init() {
 	importer.Register("pocket", &imp{})
@@ -133,20 +124,31 @@ type run struct {
 	im          *imp
 	incremental bool // whether we've completed a run in the past
 
-	oauthClient *oauth.Client      // No need to guard, used read-only.
-	accessCreds *oauth.Credentials // No need to guard, used read-only.
-
 	mu     sync.Mutex // guards anyErr
 	anyErr bool
 }
 
 var forceFullImport, _ = strconv.ParseBool(os.Getenv("CAMLI_POCKET_FULL_IMPORT"))
 
-func (im *imp) Run(ctx *importer.RunContext) error {
-	clientId, secret, err := ctx.Credentials()
+// auth returns a new oauth2 Config
+func auth(ctx *importer.SetupContext) (*oauth2.Config, error) {
+	clientID, secret, err := ctx.Credentials()
 	if err != nil {
-		return fmt.Errorf("no API credentials: %v", err)
+		return nil, err
 	}
+	return &oauth2.Config{
+		ClientID:     clientID,
+		ClientSecret: secret,
+		Endpoint: oauth2.Endpoint{
+			AuthURL:  authURL,
+			TokenURL: tokenURL,
+		},
+		RedirectURL: ctx.CallbackURL(),
+		// No scope needed for foursquare as far as I can tell
+	}, nil
+}
+
+func (im *imp) Run(ctx *importer.RunContext) error {
 	acctNode := ctx.AccountNode()
 	accessToken := acctNode.Attr(importer.AcctAttrAccessToken)
 	accessSecret := acctNode.Attr(importer.AcctAttrAccessTokenSecret)
@@ -157,20 +159,6 @@ func (im *imp) Run(ctx *importer.RunContext) error {
 		RunContext:  ctx,
 		im:          im,
 		incremental: !forceFullImport && acctNode.Attr(importer.AcctAttrCompletedVersion) == runCompleteVersion,
-
-		oauthClient: &oauth.Client{
-			TemporaryCredentialRequestURI: temporaryCredentialRequestURL,
-			ResourceOwnerAuthorizationURI: resourceOwnerAuthorizationURL,
-			TokenRequestURI:               tokenRequestURL,
-			Credentials: oauth.Credentials{
-				Token:  clientId,
-				Secret: secret,
-			},
-		},
-		accessCreds: &oauth.Credentials{
-			Token:  accessToken,
-			Secret: accessSecret,
-		},
 	}
 
 	userID := acctNode.Attr(importer.AcctAttrUserID)
@@ -185,7 +173,7 @@ func (im *imp) Run(ctx *importer.RunContext) error {
 		}
 	}
 
-	acctNode, err = ctx.Host.ObjectFromRef(acctNode.PermanodeRef())
+	acctNode, err := ctx.Host.ObjectFromRef(acctNode.PermanodeRef())
 	if err != nil {
 		return fmt.Errorf("error reloading account node: %v", err)
 	}
@@ -203,64 +191,6 @@ func (im *imp) Run(ctx *importer.RunContext) error {
 	return nil
 }
 
-var _ importer.LongPoller = (*imp)(nil)
-
-func (im *imp) LongPoll(rctx *importer.RunContext) error {
-	clientId, secret, err := rctx.Credentials()
-	if err != nil {
-		return err
-	}
-
-	acctNode := rctx.AccountNode()
-	accessToken := acctNode.Attr(importer.AcctAttrAccessToken)
-	accessSecret := acctNode.Attr(importer.AcctAttrAccessTokenSecret)
-	if accessToken == "" || accessSecret == "" {
-		return errors.New("access credentials not found")
-	}
-	oauthClient := &oauth.Client{
-		TemporaryCredentialRequestURI: temporaryCredentialRequestURL,
-		ResourceOwnerAuthorizationURI: resourceOwnerAuthorizationURL,
-		TokenRequestURI:               tokenRequestURL,
-		Credentials: oauth.Credentials{
-			Token:  clientId,
-			Secret: secret,
-		},
-	}
-	accessCreds := &oauth.Credentials{
-		Token:  accessToken,
-		Secret: accessSecret,
-	}
-
-	form := url.Values{"with": {"user"}}
-	req, _ := http.NewRequest("GET", "https://userstream.twitter.com/1.1/user.json", nil)
-	req.Header.Set("Authorization", oauthClient.AuthorizationHeader(accessCreds, "GET", req.URL, form))
-	req.URL.RawQuery = form.Encode()
-	req.Cancel = rctx.Context().Done()
-
-	log.Printf("twitter: beginning long poll, awaiting new tweets...")
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-	if res.StatusCode != 200 {
-		return errors.New(res.Status)
-	}
-	bs := bufio.NewScanner(res.Body)
-	for bs.Scan() {
-		line := strings.TrimSpace(bs.Text())
-		if line == "" || strings.HasPrefix(line, `{"friends`) {
-			continue
-		}
-		log.Printf("twitter: long poll saw activity")
-		return nil
-	}
-	if err := bs.Err(); err != nil {
-		return err
-	}
-	return errors.New("twitter: got EOF without a tweet")
-}
-
 func (r *run) errorf(format string, args ...interface{}) {
 	log.Printf("pocket: "+format, args...)
 	r.mu.Lock()
@@ -268,16 +198,46 @@ func (r *run) errorf(format string, args ...interface{}) {
 	r.anyErr = true
 }
 
-func (r *run) doAPI(result interface{}, apiPath string, keyval ...string) error {
-	return importer.OAuthContext{
-		r.Context(),
-		r.oauthClient,
-		r.accessCreds}.PopulateJSONFromURL(result, http.MethodGet, apiURL+apiPath, keyval...)
+func (r *run) doAPI(ctx context.Context, form url.Values, result interface{}, apiPath string, keyval ...string) error {
+	if len(keyval)%2 == 1 {
+		panic("Incorrect number of keyval arguments")
+	}
+
+	for i := 0; i < len(keyval); i += 2 {
+		form.Set(keyval[i], keyval[i+1])
+	}
+
+	fullURL := apiURL + apiPath
+	res, err := doGet(ctx, fullURL, form)
+	if err != nil {
+		return err
+	}
+	err = httputil.DecodeJSON(res, result)
+	if err != nil {
+		log.Printf("Error parsing response for %s: %v", fullURL, err)
+	}
+	return err
+}
+
+func doGet(ctx context.Context, url string, form url.Values) (*http.Response, error) {
+	requestURL := url + "?" + form.Encode()
+	req, err := http.NewRequest("GET", requestURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	res, err := ctxutil.Client(ctx).Do(req)
+	if err != nil {
+		log.Printf("Error fetching %s: %v", url, err)
+		return nil, err
+	}
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Get request on %s failed with: %s", requestURL, res.Status)
+	}
+	return res, nil
 }
 
 // importItems imports the items related to userID, through apiPath.
 func (r *run) importItems(userID string, apiPath string) error {
-	maxID := ""
 	continueRequests := true
 
 	var itemNode *importer.Object
@@ -291,12 +251,6 @@ func (r *run) importItems(userID string, apiPath string) error {
 	numTweets := 0
 	sawTweet := map[string]bool{}
 
-	// If attrs is changed, so should the expected responses accordingly for the
-	// RoundTripper of MakeTestData (testdata.go).
-	attrs := []string{
-		"user_id", userID,
-		"count", strconv.Itoa(tweetRequestLimit),
-	}
 	for continueRequests {
 		select {
 		case <-r.Context().Done():
@@ -307,14 +261,8 @@ func (r *run) importItems(userID string, apiPath string) error {
 
 		var resp []*pocketItem
 		var err error
-		if maxID == "" {
-			log.Printf("twitter: fetching %s for userid %s", importType, userID)
-			err = r.doAPI(&resp, apiPath, attrs...)
-		} else {
-			log.Printf("twitter: fetching %s for userid %s with max ID %s", userID, importType, maxID)
-			err = r.doAPI(&resp, apiPath,
-				append(attrs, "max_id", maxID)...)
-		}
+		log.Printf("pocket: fetching %s for userid %s", importType, userID)
+		// resp, err = doGet(r.Context(), apiPath, nil)
 		if err != nil {
 			return err
 		}
@@ -335,7 +283,6 @@ func (r *run) importItems(userID string, apiPath string) error {
 			}
 			sawTweet[tweet.Id] = true
 			newThisBatch++
-			maxID = tweet.Id
 
 			gate.Start()
 			grp.Go(func() error {
@@ -347,7 +294,7 @@ func (r *run) importItems(userID string, apiPath string) error {
 					allDupMu.Unlock()
 				}
 				if err != nil {
-					r.errorf("error importing tweet %s %v", tweet.Id, err)
+					r.errorf("error importing item %s %v", tweet.Id, err)
 				}
 				return err
 			})
@@ -487,84 +434,45 @@ type userInfo struct {
 }
 
 func (im *imp) ServeSetup(w http.ResponseWriter, r *http.Request, ctx *importer.SetupContext) error {
-	oauthClient, err := ctx.NewOAuthClient(oAuthURIs)
+	oauthConfig, err := auth(ctx)
 	if err != nil {
-		err = fmt.Errorf("error getting OAuth client: %v", err)
-		httputil.ServeError(w, r, err)
 		return err
 	}
-	oauthClient.SignForm()
-	tempCred, err := oauthClient.RequestTemporaryCredentials(ctxutil.Client(ctx), ctx.CallbackURL(), nil)
+	oauthConfig.RedirectURL = im.RedirectURL(im, ctx)
+	state, err := im.RedirectState(im, ctx)
 	if err != nil {
-		err = fmt.Errorf("Error getting temp cred: %v", err)
-		httputil.ServeError(w, r, err)
 		return err
 	}
-	if err := ctx.AccountNode.SetAttrs(
-		importer.AcctAttrTempToken, tempCred.Token,
-		importer.AcctAttrTempSecret, tempCred.Secret,
-	); err != nil {
-		err = fmt.Errorf("Error saving temp creds: %v", err)
-		httputil.ServeError(w, r, err)
-		return err
-	}
-
-	authURL := oauthClient.AuthorizationURL(tempCred, nil)
-	http.Redirect(w, r, authURL, 302)
+	http.Redirect(w, r, oauthConfig.AuthCodeURL(state), http.StatusFound)
 	return nil
 }
 
 func (im *imp) ServeCallback(w http.ResponseWriter, r *http.Request, ctx *importer.SetupContext) {
-	tempToken := ctx.AccountNode.Attr(importer.AcctAttrTempToken)
-	tempSecret := ctx.AccountNode.Attr(importer.AcctAttrTempSecret)
-	if tempToken == "" || tempSecret == "" {
-		log.Printf("pocket: no temp creds in callback")
-		httputil.BadRequestError(w, "no temp creds in callback")
-		return
-	}
-	if tempToken != r.FormValue("oauth_token") {
-		log.Printf("pocket: unexpected oauth_token: got %v, want %v", r.FormValue("oauth_token"), tempToken)
-		httputil.BadRequestError(w, "unexpected oauth_token")
-		return
-	}
-	oauthClient, err := ctx.NewOAuthClient(oAuthURIs)
+	oauthConfig, err := auth(ctx)
 	if err != nil {
-		err = fmt.Errorf("error getting OAuth client: %v", err)
-		httputil.ServeError(w, r, err)
-		return
-	}
-	tokenCred, vals, err := oauthClient.RequestToken(
-		ctxutil.Client(ctx),
-		&oauth.Credentials{
-			Token:  tempToken,
-			Secret: tempSecret,
-		},
-		r.FormValue("oauth_verifier"),
-	)
-	if err != nil {
-		httputil.ServeError(w, r, fmt.Errorf("Error getting request token: %v ", err))
-		return
-	}
-	userid := vals.Get("user_id")
-	if userid == "" {
-		httputil.ServeError(w, r, fmt.Errorf("Couldn't get user id: %v", err))
-		return
-	}
-	if err := ctx.AccountNode.SetAttrs(
-		importer.AcctAttrAccessToken, tokenCred.Token,
-		importer.AcctAttrAccessTokenSecret, tokenCred.Secret,
-	); err != nil {
-		httputil.ServeError(w, r, fmt.Errorf("Error setting token attributes: %v", err))
+		httputil.ServeError(w, r, fmt.Errorf("Error getting oauth config: %v", err))
 		return
 	}
 
-	if err := ctx.AccountNode.SetAttrs(
-		nodeattr.Title, fmt.Sprintf("%s's Pocket Account", "TODO"),
-	); err != nil {
-		httputil.ServeError(w, r, fmt.Errorf("Error setting attribute: %v", err))
+	if r.Method != "GET" {
+		http.Error(w, "Expected a GET", 400)
 		return
 	}
+	code := r.FormValue("code")
+	if code == "" {
+		http.Error(w, "Expected a code", 400)
+		return
+	}
+	token, err := oauthConfig.Exchange(ctx, code)
+	log.Printf("Token = %#v, error %v", token, err)
+	if err != nil {
+		log.Printf("Token Exchange error: %v", err)
+		http.Error(w, "token exchange error", 500)
+		return
+	}
+
 	http.Redirect(w, r, ctx.AccountURL(), http.StatusFound)
+
 }
 
 type pocketMedia interface {

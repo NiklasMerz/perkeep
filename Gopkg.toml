@@ -253,11 +253,6 @@ ignored = [
   name = "golang.org/x/net"
   revision = "d866cfc389cec985d6fda2859936a575a55a3ab6"
 
-# picago uses branch="master", override for now to match our explicit version
-[[override]]
-  revision = "197281d4e0ecd78c33865daf9c6e51626feefcb2"
-  name = "golang.org/x/oauth2"
-
 [[constraint]]
   name = "golang.org/x/sync"
   revision = "fd80eb99c"

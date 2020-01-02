@@ -57,6 +57,7 @@ const (
 	userInfoAPIPath               = "account/verify_credentials.json"
 	userTimeLineAPIPath           = "statuses/user_timeline.json"
 	userLikesAPIPath              = "favorites/list.json"
+	userDirectMessagesAPIPath     = "direct_messages/events/list.json"
 
 	// runCompleteVersion is a cache-busting version number of the
 	// importer code. It should be incremented whenever the
